@@ -1,0 +1,46 @@
+{
+  "type": "module",
+  "name": "alt",
+  "version": "0.1.0",
+  "description": "An AI-powered localization tool",
+  "main": "index.mjs",
+  "bin": {
+    "alt": "./bin.mjs"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/drone1/ai-localization-tool.git"
+  },
+  "keywords": [
+    "localization",
+    "i18n",
+    "translation",
+    "cli",
+    "ai",
+    "claude",
+    "openai",
+    "gemini",
+    "google",
+    "anthropic"
+  ],
+  "author": "drone1",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/drone1/ai-localization-tool/issues"
+  },
+  "homepage": "https://github.com/drone1/ai-localization-tool#readme",
+  "dependencies": {
+    "axios": "^1.8.4",
+    "chalk": "^5.4.1",
+    "commander": "^11.1.0",
+    "figlet": "^1.8.0",
+    "strip-json-comments": "^5.0.1",
+    "term-size": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
