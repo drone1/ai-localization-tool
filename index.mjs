@@ -1,25 +1,33 @@
 import { program } from 'commander'
-import { pathToFileURL, fileURLToPath } from 'url'
 import { Buffer } from 'buffer'
+import { pathToFileURL, fileURLToPath } from 'url'
+import { Listr } from 'listr2'
 import axios from 'axios'
 import os from 'os'
 import stripJsonComments from 'strip-json-comments'
 import figlet from 'figlet'
-import chalk from 'chalk'
-import terminalSize from 'term-size'
+import gradient from 'gradient-string'
+import * as locale from 'locale-codes'
 import * as fs from 'fs/promises'
 import * as crypto from 'crypto'
 import * as path from 'path'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DEFAULT_LOCALIZATION_FILENAME = '.localization.json'
+const DEFAULT_CACHE_FILENAME = '.localization.cache.json'
+const DEFAULT_CONFIG_FILENAME = 'config.json'
 
 const CWD = process.cwd()
 const appState = {}
 
 // Helper function to parse comma-separated list
-function commaSeparatedList(value) {
-  return value.split(',').map(item => item.trim())
+function languageList(value) {
+  const languages = value.split(',').map(item => item.trim())
+  const invalid = languages.filter(lang => !locale.getByTag(lang))
+  if (invalid.length) {
+    console.error(`Found invalid language(s): ${invalid.join(', ')}`)
+    process.exit(1)
+  }
+  return languages
 }
 
 // Calculate hash of a string
@@ -29,7 +37,6 @@ function calculateHash(content) {
 
 async function readFileAsText(filePath) {
   try {
-    console.debug(`Reading file "${filePath}"...`)
     return await fs.readFile(filePath, 'utf8')
   } catch (error) {
     if (error.code === 'ENOENT') {
@@ -39,26 +46,23 @@ async function readFileAsText(filePath) {
   }
 }
 
-function isValidJson(s) {
+function parseJson(s) {
   try {
-    JSON.parse(s)
-    return true
+    return JSON.parse(s)
   } catch(e) {
-    return false
+    return null
   }
 }
 
 // Read and parse JSONC file
 async function readJsonFile(filePath, isJSONComments = false) {
-  const content = await readFileAsText(filePath)
-  return isJSONComments 
-    ? JSON.parse(stripJsonComments.stripJsonComments(content))
-    : JSON.parse(content)
+  let content = await readFileAsText(filePath)
+  if (isJSONComments) content = stripJsonComments.stripJsonComments(content)
+  return parseJson(content)
 }
 
 // Dynamically imports the javascript file at filePath, which can be relative or absolute
 async function importJsFile(filePath) {
-  console.log('importJsFile', filePath)
   if (!path.isAbsolute(filePath)) {
     filePath = path.resolve(CWD, filePath)
   }
@@ -72,6 +76,7 @@ function normalizeKey(key) {
 }
 
 function normalizeData(data) {
+  if (!data) return null
   const normalizedData = {}
   for (const [key, value] of Object.entries(data)) {
     // Force UTF-8 encoding for the key
@@ -82,8 +87,6 @@ function normalizeData(data) {
       ? Buffer.from(value, 'utf8').toString('utf8') 
       : value
 
-    console.log(`Normalized key ${utf8Key}...`)
-    
     normalizedData[normalizeKey(utf8Key)] = utf8Value
   }
   return normalizedData
@@ -132,38 +135,25 @@ async function loadTranslationProvider(providerName) {
 
 const VALID_TRANSLATION_PROVIDERS = ['claude', 'openai']
 
-function d(...args) { console.log(...args)}
+async function printLogo({ tagline }) {
+  const fontName = 'THIS.flf'
+  const fontPath = path.resolve(__dirname, `./figlet-fonts/${fontName}`)
+  const fontData = await fs.readFile(fontPath, 'utf8')
+  figlet.parseFont(fontName, fontData)
+  const asciiTitle = figlet.textSync('ALT', {
+    font: fontName,
+    horizontalLayout: 'full',
+    verticalLayout: 'default'
+  })
 
-async function printLogo({tagline}) {
-    const { columns } = terminalSize()
-
-    const fontPath = path.resolve(__dirname, './figlet-fonts/isometric1.flf')
-    const fontData = await fs.readFile(fontPath, 'utf8')
-    
-    // Register the font with Figlet
-    figlet.parseFont('isometric1', fontData)
-
-    // Generate ASCII art title
-    const asciiTitle = figlet.textSync('ALT', {
-      font: 'isometric1',
-      horizontalLayout: 'full',
-      verticalLayout: 'default'
-    })
-
-    // Center each line of the ASCII art
-    // Display the centered title
-    console.log(`${chalk.cyan(asciiTitle)}\n`)
-    
-    // Center the tagline too
-    console.log(chalk.yellow(tagline) + '\n')
+  console.log(`\n${gradient(['#000FFF', '#ed00b1'])(asciiTitle)}\n`)
 }
 
 // Main function
 export async function run() {
   try {
     const p = await readJsonFile(path.resolve(__dirname, './package.json'))
-
-    await printLogo({tagline: p.description})
+    if (!p) throw new Error(`Couldn't read 'package.json'`)
 
     // Define CLI options
     program
@@ -171,15 +161,31 @@ export async function run() {
       .description(p.description)
       .requiredOption('-r, --reference <path>', 'Path to reference JSONC file (default language)')
       .requiredOption('-o, --output-dir <path>', 'Output directory for localized files')
-      .option('-l, --languages <list>', 'Comma-separated list of language codes', commaSeparatedList)
+      .option('-l, --languages <list>', 'Comma-separated list of language codes', languageList)
       .option('-g, --referenceLanguage <language>', `The reference file's language`, 'en')
-      .option('-v, --referenceVarName <var name>', `The exported variable in the reference file, e.g. export default = {...} you'd use 'default'`, 'default')
+      .option('-j, --referenceVarName <var name>', `The exported variable in the reference file, e.g. export default = {...} you'd use 'default'`, 'default')
       .option('-f, --force', 'Force regeneration of all translations', false)
       .option('-p, --provider <name>', 'AI provider to use for translations (claude, openai)', 'claude')
-      .option('-s, --stateFile <path>', 'Path to state file', null)
+      .option('-s, --simpleRenderer', 'Use simple renderer; useful for CI', false)
+      .option('-c, --config <path>', 'Path to config file', null)
+      .option('-t, --maxRetries <integer>', 'Maximum retries on failure', 3)
+      .option('-c, --concurrent', `Maximum # of concurrent tasks`, 4)
+      .option('-v, --verbose', `Enables verbose spew`, false)
+      .option('-d, --debug', `Enables debug spew`, false)
       .parse(process.argv)
 
+    await printLogo({tagline: p.description})
     const options = program.opts()
+
+    const log = {
+      e: function(...args) { console.error(...args)},
+      w: function(...args) { console.warn(...args)},
+      d: options.debug ? function(...args) { console.debug(...args)} : () => {},
+      v: (options.debug || options.verbose) ? function(...args) { console.log(...args)} : () => {},
+      i: function(...args) { console.log(...args)}
+    }
+
+    appState.log = log
 
     // Validate provider
     if (!VALID_TRANSLATION_PROVIDERS.includes(options.provider)) {
@@ -187,167 +193,259 @@ export async function run() {
       process.exit(1)
     }
 
-    const configFilePath = !options.stateFile
-      ? path.resolve(options.outputDir, DEFAULT_LOCALIZATION_FILENAME)
-      : options.stateFile
-
-    console.log(configFilePath)
-
+    // Create a tmp dir for storing the .mjs referen ce file; we can't dynamically import .js files directly, so we make a copy...
     const tmpDir = await mkTmpDir()
     appState.tmpDir = tmpDir
-
+    //
     // Load config file or create default
-    console.log(`Attempting to load config file from "${configFilePath}"`)
+    const configFilePath = !options.config
+      ? path.resolve(options.outputDir, DEFAULT_CONFIG_FILENAME)
+      : options.config
+    log.v(`Attempting to load config file from "${configFilePath}"`)
     let config = await readJsonFile(configFilePath) || {
+      languages: [],
+      referenceLanguage: 'en',
+    }
+
+    const cacheFilePath = path.resolve(options.outputDir, DEFAULT_CACHE_FILENAME)
+    log.v(`Attempting to load cache file from "${cacheFilePath}"`)
+    const cache = await readJsonFile(cacheFilePath) || {
       referenceHash: '',
-      languages: {},
+      state: {},
       lastRun: null
     }
-
-    // Read reference file
     // Copy to a temp location first so we can ensure it has an .mjs extension
     const tmpReferencePath = await copyFileToTempAndEnsureExtension({filePath: options.reference, tmpDir, ext: 'mjs'})
-    const referenceContent = normalizeData(JSON.parse(JSON.stringify(await importJsFile(tmpReferencePath))))
+    const referenceContent = normalizeData(JSON.parse(JSON.stringify(await importJsFile(tmpReferencePath))), log)  // TODO: Don't do this
     const referenceData = referenceContent[options.referenceVarName]
-    const referenceHash = calculateHash(readFileAsText(options.reference).toString('utf8'))
-
-//bufferToUtf8
-    console.trace(referenceData)
-
-    // Check if reference file has changed
-    const referenceChanged = referenceHash !== config.referenceHash
-    
-    if (referenceChanged) {
-      console.log('Reference file has changed since last run')
-    }
-
-    // Get languages from CLI or config
-    const languages = options.languages || Object.keys(config.languages)
-    
-    if (!languages || languages.length === 0) {
-      console.error('Error: No languages specified. Use --languages option or add languages to .localization.json')
+    if (!referenceData) {
+      log.e(`No reference data found in variable "${options.referenceVarName}" in ${options.reference}`)
       process.exit(1)
     }
 
-    // Track changes for updating config
-    const updatedConfig = {
-      referenceHash,
-      languages: {},
-      lastRun: new Date().toISOString()
+    const referenceHash = calculateHash(readFileAsText(options.reference).toString('utf8'))
+
+    const referenceChanged = referenceHash !== cache.referenceHash
+    if (referenceChanged) {
+      log.v('Reference file has changed since last run')
     }
+
+    // Get languages from CLI or config
+    const languages = options.languages || config.languages
+    if (!languages || languages.length === 0) {
+      console.error('Error: No languages specified. Use --languages option or add languages to your config file')
+      process.exit(1)
+    }
+
+    cache.referenceHash = referenceHash
+    cache.lastRun = new Date().toISOString()
 
     const { apiKey, api: translationProvider } = await loadTranslationProvider(options.provider)
 
+    const tasks = new Listr([], {
+      concurrent: false, // Process languages one by one
+      ...(options.simpleRenderer ? { renderer: 'simple' } : {}),
+      rendererOptions: { collapse: false, clearOutput: false },
+      clearOutput: false,
+    })
+
     // Process each language
     for (const lang of languages) {
-      console.log(`Processing language: ${lang}`)
-      
-      const outputFile = path.join(options.outputDir, `${lang.toLowerCase()}.json`)
-      console.log('outputFile', outputFile)
-      let outputData = normalizeData(await readJsonFile(outputFile))
-      console.log(outputData)
-      if (!isValidJson(outputData)) outputData = {}
+      let stringsTranslatedForLanguage = 0
 
-      // TODO: NOT USED
       let needsUpdate = options.force || referenceChanged
       
-      // Initialize language in config if it doesn't exist
-      if (!config.languages[lang]) {
-        config.languages[lang] = { keyHashes: {} }
+      //const rootSpinner = ora(`[${lang}] Processing all keys for language...`).start()
+      
+      const outputFilePath = path.join(options.outputDir, `${lang.toLowerCase()}.json`)
+      let outputData = normalizeData(await readJsonFile(outputFilePath)) || {}
+      log.d('outputData', outputData)
+      log.d(Object.keys(outputData))
+
+      // Initialize language in cache if it doesn't exist
+      if (!cache.state[lang]) {
+        log.v(`lang ${lang} not in cache; update needed...`)
+        cache.state[lang] = { keyHashes: {} }
         needsUpdate = true
       }
       
-      updatedConfig.languages[lang] = { keyHashes: {} }
-      
       // Check if output file exists and has correct structure
       if (!outputData) {
-        console.log(`Creating new file for language: ${lang}`)
+        //rootSpinner.info(`File for language "${lang}" did not exist; update needed...`)
         outputData = {}
         needsUpdate = true
       }
 
+      log.d(outputData)
+
       Object.keys(outputData).forEach(key => {
-        console.log(`Output key: "${key}", Bytes:`, Buffer.from(key).toString('hex'))
+        log.d(`Output key: "${key}", Bytes:`, Buffer.from(key).toString('hex'))
       })
 
-      // Process each key in reference file
-      for (const key of Object.keys(referenceData)) {
-        d('key', key)
-        d(outputData[key])
-        const refValue = referenceData[key]
+      tasks.add([{
+          title: `Localize "${lang}"`,
+          task: async (ctx, task) => {
+            ctx.nextTaskDelayMs = 0
+            const subtasks = Object.keys(referenceData).map(key => ({
+                title: `Processing "${key}"`,
+                task: async (ctx, subtask) => {
+                  const { success, translated, newValue, error } = await translateKeyForLanguage({
+                    task: subtask,
+                    ctx,
+                    translationProvider,
+                    apiKey,
+                    cache,
+                    lang,
+                    key, 
+                    refValue: referenceData[key],
+                    curValue: (key in outputData) ? outputData[key] : null,
+                    options,
+                    log
+                  })
 
-      // When reading keys from files
-       console.log(`Reference key: "${key}", Bytes:`, Buffer.from(key).toString('hex'))
+                  if (success) {
+                    ++stringsTranslatedForLanguage 
 
-        // Skip non-string values (objects, arrays, etc.)
-        if (typeof refValue !== 'string') {
-          outputData[key] = refValue
-          console.warn(`Value for reference key "${key}" was not a string! Skipping...`)
-          continue
+                    // Write updated translations
+                    outputData[key] = newValue
+                    await writeJsonFile(outputFilePath, outputData)
+                    log.v(`Wrote ${outputFilePath}`)
+
+                    // Update state file every time, in case the user kills the process
+                    await writeJsonFile(cacheFilePath, cache)
+                    log.v(`Wrote ${cacheFilePath}`)
+
+                    subtask.title = translated ? `Translated ${key}: "${newValue}"` : `No update needed for ${key}`
+                  } else if (error) {
+                    throw new Error(error)
+                  }
+                }
+              }))
+
+            return task.newListr(
+              subtasks, {
+                concurrent: parseInt(options.concurrent),
+                rendererOptions: { collapse: true, persistentOutput: true },
+              }
+            )
         }
-        
-        const currentValueHash = outputData[key] ? calculateHash(outputData[key]) : null
-        const storedHash = config.languages[lang]?.keyHashes?.[key]
+      }])
 
-        console.log('currentValueHash', currentValueHash)
-        console.log('storedHash', storedHash)
-        
-        // Check if translation needs update
-        if (
-          options.force || 
-          !outputData[key] || 
-          !storedHash || 
-          currentValueHash !== storedHash
-        ) {
-          console.log(`Translating key "${key}" for language "${lang}"`)
-          
-          try {
-            // Call translation provider
-            const translated = await translationProvider.translate({
-              text: refValue,
-              targetLang: lang,
-              sourceLang: options.referenceLanguage,
-              apiKey,
-              deps: { axios }
-            })
-
-            console.log(translated)
-            outputData[key] = translated
-            
-            // Update hash in config
-            const hashForTranslated = calculateHash(outputData[key])
-            console.log(hashForTranslated)
-            updatedConfig.languages[lang].keyHashes[key] = hashForTranslated
-          } catch (error) {
-            console.error(`Error translating key "${key}" for language "${lang}":`, error.message)
-            // Keep existing translation if available
-            if (outputData[key]) {
-              updatedConfig.languages[lang].keyHashes[key] = currentValueHash
-            }
-          }
-        } else {
-          // Keep existing translation and hash
-          console.log(`Keeping existing translation and hash for ${lang}/${key}...`)
-          updatedConfig.languages[lang].keyHashes[key] = storedHash
-        }
-      }
-      
-      // Write updated translations
-      await writeJsonFile(outputFile, outputData)
-      console.log(`Updated ${outputFile}`)
-    
-      // Update state file every time, in case the user kills the process
-      await writeJsonFile(configFilePath, updatedConfig)
-      console.log(`Updated ${configFilePath}`)
+      //rootSpinner.succeed(`[${lang}] Processed with ${stringsTranslatedForLanguage === 0 ? 'no' : stringsTranslatedForLanguage} updates`)
     }
 
-    await shutdown(appState)
+    tasks.add({
+      'title': 'Cleanup',
+      task: () => shutdown(appState, false)
+    })
 
-    console.log('Localization completed successfully')
+    await tasks.run()
   } catch (error) {
-    console.error('Error:', error.message)
+    console.error('Error:', error)  // NB: 'log' doesn't exist here
     process.exit(1)
   }
+}
+
+async function translateKeyForLanguage({task, ctx, translationProvider, apiKey, cache, lang, key, refValue, curValue, options: { force, referenceLanguage, maxRetries }, log}) {
+  const result = { success: true, translated: false, newValue: null, error: null }
+
+  // When reading keys from files
+  log.d(`Reference key: "${key}", Bytes:`, Buffer.from(key).toString('hex'))
+
+  // Skip non-string values (objects, arrays, etc.)
+  if (typeof refValue !== 'string') {
+    result.error = `Value for reference key "${key}" was not a string! Skipping...`
+    result.success = false
+    return result
+  }
+  
+  const currentValueHash = curValue?.length ? calculateHash(curValue) : null
+  const storedHash = cache.state[lang]?.keyHashes?.[key]
+
+  log.d('currentValueHash', currentValueHash)
+  log.d('storedHash', storedHash)
+  
+  // Check if translation needs update
+  const missingOutputKey = curValue === null
+  const hashesDiffer = currentValueHash !== storedHash
+
+  //const languageSpinner = ora({ prefixText: ' ', text: `Processing key "${key}"...` }).start()
+
+  if (
+    force || 
+    missingOutputKey || 
+    !storedHash || 
+    hashesDiffer
+  ) {
+    if (force) log.d(`Forcing update...`)
+    if (missingOutputKey) log.d(`No "${key}" in output data...`)
+    if (!storedHash) log.d(`Hash was not found in storage...`)
+    if (hashesDiffer) log.d(`Hashes differ (${currentValueHash} / ${storedHash})...`)
+
+    try {
+      // Call translation provider
+      //languageSpinner.info(`[${lang}] Translating "${key}"...`)
+      log.d(`[${lang}] Translating "${key}"...`)
+      task.title = `Translating "${key}"...`
+
+      const providerName = translationProvider.name()
+      task.title = `Translating with ${providerName}`
+      let translated = null
+      let newValue
+
+      for (let attempt = 0; !newValue && attempt <= maxRetries; ++attempt) {
+        log.d(`[translate] attempt=${attempt}`)
+
+        if (ctx.nextTaskDelayMs > 0) {
+          task.title = `Rate limited; sleeping for ${Math.floor(ctx.nextTaskDelayMs/1000)}s...`
+          await sleep(ctx.nextTaskDelayMs)
+        }
+
+        const translateResult = await translate({
+          task,
+          provider: translationProvider,
+          text: refValue,
+          sourceLang: referenceLanguage,
+          targetLang: lang,
+          apiKey,
+          maxRetries: maxRetries,
+          log,
+        })
+
+        if (translateResult.rateLimited) {
+          task.title = 'Rate limited'
+          const sleepInterval = translateResult.response?.headers ? translationProvider.getSleepInterval(translateResult.response.headers) : 0
+          console.log(sleepInterval)
+          ctx.nextTaskDelayMs = Math.max(ctx.nextTaskDelayMs, sleepInterval)
+        } else {
+          newValue = translateResult.translated
+        }
+      }
+    
+      if (!newValue?.length) throw new Error(`Translation was empty`)
+
+      log.d('translated text', newValue)
+      result.translated = true
+      result.newValue = newValue
+   
+      const hashForTranslated = calculateHash(newValue)
+      log.d(`Updating hash for translated ${lang}.${key}: ${hashForTranslated}`)
+      cache.state[lang].keyHashes[key] = hashForTranslated
+    } catch (error) {
+      throw error
+      //languageSpinner.warn(`Failed to translate key "${key}" for language "${lang}": ${error.message}`)
+      // Keep existing translation if available
+      //if (curValue) {
+        //cache.state[lang].keyHashes[key] = currentValueHash
+        //languageSpinner.warn(`Error translating key "${key}" for language "${lang}": ${error.message}`)
+      //}
+    }
+  } else {
+    log.v(`Keeping existing translation and hash for ${lang}/${key}...`)
+    cache.state[lang].keyHashes[key] = storedHash
+  }
+
+  return result
 }
 
 async function mkTmpDir() {
@@ -381,12 +479,42 @@ async function rmDir(dir) {
   }
 }
 
-async function shutdown(appState) {
+async function shutdown(appState, exit) {
   if (appState?.tmpDir) {
-    console.log(`Cleaning up...`)
     rmDir(appState.tmpDir)
+    if (exit) process.exit(1)
   }
 }
 
-process.on('SIGINT', async () => await shutdown(appState))
-process.on('SIGTERM', async () => await shutdown(appState))
+export function sleep(ms, log) {
+	if (ms === 0) return
+	return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function translate({task, provider, text, sourceLang, targetLang, apiKey, log }) {
+  const result = { translated: null, rateLimited: false, response: null }
+
+  try {
+    const providerName = provider.name()
+    task.title = `Preparing endpoint configuration...`
+    const { url, params, config } = provider.getTranslationRequestDetails({ text, sourceLang, targetLang, apiKey, log })
+    task.title = `Hitting ${providerName} endpoint...`
+    const response = await axios.post(url, params, config)
+    log.d('response headers', response.headers)
+    const translated = provider.getResult(response, log)
+    if (!translated?.length) throw new Error(`${providerName} translated text to empty string`)
+    result.translated = translated
+  } catch (error) {
+    if (error.response && error.response.status === 429) {
+      result.rateLimited = true
+      result.response = error.response
+    } else {
+      log.w(`API failed with error`, error)
+    }
+  }
+
+  return result
+}
+
+process.on('SIGINT', async () => await shutdown(appState, true))
+process.on('SIGTERM', async () => await shutdown(appState, true))
